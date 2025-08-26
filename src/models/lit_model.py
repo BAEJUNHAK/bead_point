@@ -11,7 +11,7 @@ from ..losses.heatmap_utils import make_heatmaps_torch, make_combined_heatmaps_f
 
 
 class LitKeypoint2(pl.LightningModule):
-    def __init__(self, img_size: int = 512, sigma: float = 5.0, lr: float = 3e-4,
+    def __init__(self, img_size: int = 512, sigma: float = 6.0, lr: float = 5e-4,
                  pck_thresh_px: float = 5.0, sigma_polyline: float = 3.0, polyline_weight: float = 0.3):
         super().__init__()
         self.save_hyperparameters()
@@ -52,15 +52,27 @@ class LitKeypoint2(pl.LightningModule):
             
         pred_xy = heatmaps_to_coords_argmax(prob)  # [B,2,2] - 마스크된 영역에서 argmax
 
-        # MAE(px) over 2 points - 유클리드 거리 기반
+        # MAE(px) - P1, P2 개별 및 전체 계산
         mae_per_point = torch.linalg.norm(pred_xy - gt_xy, dim=-1)  # [B,2] - 각 포인트별 유클리드 거리
-        mae_px = mae_per_point.mean()  # 모든 배치와 포인트의 평균
+        mae_p1 = mae_per_point[:, 0].mean()  # P1 전용 MAE
+        mae_p2 = mae_per_point[:, 1].mean()  # P2 전용 MAE
+        mae_px = mae_per_point.mean()        # 전체 평균 (기존 호환성)
 
-        # PCK@thr(px): 두 점 평균
+        # PCK@thr(px) - P1, P2 개별 및 전체 계산
         dist = torch.linalg.norm(pred_xy - gt_xy, dim=-1)  # [B,2]
-        pck = (dist <= self.pck_thresh_px).float().mean()
+        pck_p1 = (dist[:, 0] <= self.pck_thresh_px).float().mean()  # P1 전용 PCK
+        pck_p2 = (dist[:, 1] <= self.pck_thresh_px).float().mean()  # P2 전용 PCK
+        pck = (dist <= self.pck_thresh_px).float().mean()           # 전체 평균
 
-        return {"mae_px": mae_px, "pck_px": pck}
+        return {
+            "mae_px": mae_px,      # 전체 평균 (기존 호환성)
+            "mae_p1": mae_p1,      # P1 개별 MAE
+            "mae_p2": mae_p2,      # P2 개별 MAE
+            "mae_ratio": mae_p1 / (mae_p2 + 1e-8),  # MAE 불균형 지표
+            "pck_px": pck,         # 전체 평균 (기존 호환성)
+            "pck_p1": pck_p1,      # P1 개별 PCK
+            "pck_p2": pck_p2,      # P2 개별 PCK
+        }
 
     def training_step(self, batch, batch_idx):
         img = batch["image"]  # [B,3,H,W]
@@ -86,18 +98,37 @@ class LitKeypoint2(pl.LightningModule):
         mask_expanded = polyline_mask.unsqueeze(1).expand_as(target)  # [B,2,H,W]
         target_constrained = target * mask_expanded  # 타겟도 마스크 적용
         
-        # 마스크 영역에서만 Loss 계산
-        mask_bool = mask_expanded.bool()  # bool 타입으로 변환
-        prob_masked = prob[mask_bool]  # [N] - 마스크 True인 픽셀만
-        target_masked = target_constrained[mask_bool]  # [N] - 제약된 타겟
+        # P1, P2 개별 Loss 계산 (분리 학습)
+        pred_p1 = prob[:, 0:1] * mask_expanded[:, 0:1]  # P1 채널만
+        pred_p2 = prob[:, 1:2] * mask_expanded[:, 1:2]  # P2 채널만
+        target_p1 = target_constrained[:, 0:1]          # P1 타겟만
+        target_p2 = target_constrained[:, 1:2]          # P2 타겟만
         
-        loss = F.mse_loss(prob_masked, target_masked)
+        loss_p1 = F.mse_loss(pred_p1, target_p1) * 100  # Loss 스케일링 적용
+        loss_p2 = F.mse_loss(pred_p2, target_p2) * 100  # Loss 스케일링 적용
+        loss = loss_p1 + loss_p2
+        
         m = self._metrics(logit, gt, polyline_mask)  # 마스크 전달하여 제약조건 적용
+        # 기본 로깅 (모든 메트릭)
         self.log_dict({
             "train_loss": loss,
+            "train_loss_p1": loss_p1,
+            "train_loss_p2": loss_p2,
+            "train_loss_ratio": loss_p1 / (loss_p2 + 1e-8),
             "train_mae_px": m["mae_px"],
+            "train_mae_p1": m["mae_p1"],
+            "train_mae_p2": m["mae_p2"],
+            "train_mae_ratio": m["mae_ratio"],
             "train_pck_px": m["pck_px"],
-        }, prog_bar=True, on_step=True, on_epoch=True, batch_size=img.size(0))
+            "train_pck_p1": m["pck_p1"],
+            "train_pck_p2": m["pck_p2"],
+        }, on_step=True, on_epoch=True, batch_size=img.size(0))
+        
+        # Progress bar에 핵심 메트릭 개별 로깅
+        self.log("loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("p1", loss_p1, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("p2", loss_p2, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("ratio", loss_p1 / (loss_p2 + 1e-8), prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -124,18 +155,37 @@ class LitKeypoint2(pl.LightningModule):
         mask_expanded = polyline_mask.unsqueeze(1).expand_as(target)  # [B,2,H,W]
         target_constrained = target * mask_expanded  # 타겟도 마스크 적용
         
-        # 마스크 영역에서만 Loss 계산
-        mask_bool = mask_expanded.bool()  # bool 타입으로 변환
-        prob_masked = prob[mask_bool]  # [N] - 마스크 True인 픽셀만
-        target_masked = target_constrained[mask_bool]  # [N] - 제약된 타겟
+        # P1, P2 개별 Loss 계산 (분리 학습)
+        pred_p1 = prob[:, 0:1] * mask_expanded[:, 0:1]  # P1 채널만
+        pred_p2 = prob[:, 1:2] * mask_expanded[:, 1:2]  # P2 채널만
+        target_p1 = target_constrained[:, 0:1]          # P1 타겟만
+        target_p2 = target_constrained[:, 1:2]          # P2 타겟만
         
-        loss = F.mse_loss(prob_masked, target_masked)
+        loss_p1 = F.mse_loss(pred_p1, target_p1) * 100  # Loss 스케일링 적용
+        loss_p2 = F.mse_loss(pred_p2, target_p2) * 100  # Loss 스케일링 적용
+        loss = loss_p1 + loss_p2
+        
         m = self._metrics(logit, gt, polyline_mask)  # 마스크 전달하여 제약조건 적용
+        # 기본 로깅 (모든 메트릭)
         self.log_dict({
             "val_loss": loss,
+            "val_loss_p1": loss_p1,
+            "val_loss_p2": loss_p2,
+            "val_loss_ratio": loss_p1 / (loss_p2 + 1e-8),
             "val_mae_px": m["mae_px"],
+            "val_mae_p1": m["mae_p1"],
+            "val_mae_p2": m["mae_p2"],
+            "val_mae_ratio": m["mae_ratio"],
             "val_pck_px": m["pck_px"],
-        }, prog_bar=True, on_step=False, on_epoch=True, batch_size=img.size(0))
+            "val_pck_p1": m["pck_p1"],
+            "val_pck_p2": m["pck_p2"],
+        }, on_step=False, on_epoch=True, batch_size=img.size(0))
+        
+        # Progress bar에 핵심 메트릭 개별 로깅
+        self.log("v_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("v_p1", loss_p1, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("v_p2", loss_p2, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("v_ratio", loss_p1 / (loss_p2 + 1e-8), prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
