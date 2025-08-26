@@ -29,17 +29,24 @@ class BeadPointInference:
         """
         self.device = self._setup_device(device)
         
-        # 코드베이스에서 추출한 실제 파라미터들
+        # 새로운 손실 시스템 파라미터
         self.model_params = {
             "img_size": 256,  # hparams.yaml에서 확인
-            "sigma": 5.0,
-            "sigma_polyline": 2.5,
+            "sigma": 3.0,     # 새로운 권장값: 3px (기존 5.0에서 변경)
+            "sigma_polyline": 3.0,
             "polyline_weight": 0.3,
             "pck_thresh_px": 5.0,
             "lr": 0.0001, 
             "base": 64,  # lit_model.py에서 확인된 base=64
             "in_ch": 3,
-            "out_ch": 2
+            "out_ch": 2,
+            # 새로운 손실 시스템 파라미터
+            "lambda_heatmap": 1.0,     # 히트맵 MSE 가중치
+            "lambda_coord": 0.2,       # 좌표 Huber 가중치
+            "lambda_separation": 0.0,  # 분리 힌지 가중치 (기본: 비활성화)
+            "huber_delta": 2.0,        # Huber 전환점 (2px)
+            "min_separation": 5.0,     # 최소 분리 거리 (5px)
+            "temperature": 0.02        # soft-argmax 온도 (0.02)
         }
         
         # 최적 체크포인트 파일 자동 선택
@@ -104,7 +111,13 @@ class BeadPointInference:
                 sigma_polyline=self.model_params["sigma_polyline"],
                 polyline_weight=self.model_params["polyline_weight"],
                 pck_thresh_px=self.model_params["pck_thresh_px"],
-                lr=self.model_params["lr"]
+                lr=self.model_params["lr"],
+                lambda_heatmap=self.model_params["lambda_heatmap"],
+                lambda_coord=self.model_params["lambda_coord"],
+                lambda_separation=self.model_params["lambda_separation"],
+                huber_delta=self.model_params["huber_delta"],
+                min_separation=self.model_params["min_separation"],
+                temperature=self.model_params["temperature"]
             )
         except Exception as e:
             print(f"⚠️ Lightning 로드 실패, 수동 로드 시도: {e}")
@@ -124,7 +137,13 @@ class BeadPointInference:
             sigma_polyline=self.model_params["sigma_polyline"], 
             polyline_weight=self.model_params["polyline_weight"],
             pck_thresh_px=self.model_params["pck_thresh_px"],
-            lr=self.model_params["lr"]
+            lr=self.model_params["lr"],
+            lambda_heatmap=self.model_params["lambda_heatmap"],
+            lambda_coord=self.model_params["lambda_coord"],
+            lambda_separation=self.model_params["lambda_separation"],
+            huber_delta=self.model_params["huber_delta"],
+            min_separation=self.model_params["min_separation"],
+            temperature=self.model_params["temperature"]
         )
         
         # 체크포인트 로드
