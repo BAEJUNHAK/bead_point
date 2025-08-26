@@ -1,0 +1,7 @@
+torch
+torchvision
+pytorch-lightning
+opencv-python==4.7.0.72
+numpy==1.21.6
+onnx==1.14.1
+onnxruntime==1.15.1
