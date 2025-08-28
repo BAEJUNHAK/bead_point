@@ -182,6 +182,8 @@ class TrainingVisualizerCallback(Callback):
         
         self.sample_counter = 0
         self.current_epoch_samples = []
+        self.fixed_samples = []  # 고정된 시각화용 샘플들
+        self.samples_initialized = False  # 고정 샘플 초기화 완료 여부
         
         # 시각화 기능 활성화 (내장 도구 사용)
         self.viz_tool = SimpleVisualizationTool()
@@ -244,32 +246,42 @@ class TrainingVisualizerCallback(Callback):
         """학습 배치 종료 시 샘플 수집"""
         current_epoch = trainer.current_epoch
         
-        # 지정된 에포크에서만 샘플 수집
-        if (current_epoch + 1) % self.save_every_n_epochs != 0:
-            return
+        # 1. 첫 번째 에포크에서 고정 샘플 수집
+        if not self.samples_initialized and current_epoch == 0:
+            # 배치 5에서 2개 샘플 모두 수집
+            if batch_idx == 5 and len(self.fixed_samples) == 0:
+                try:
+                    batch_size = batch['image'].shape[0]
+                    # 배치에서 최대 2개 샘플 수집
+                    num_samples = min(batch_size, self.max_samples_per_epoch)
+                    
+                    for i in range(num_samples):
+                        sample_data = {
+                            'image': batch['image'][i].cpu(),  # [3, H, W]
+                            'target_coords': batch['coord_px'][i].cpu(),  # [2, 2]
+                            'polyline_mask': batch.get('polyline_mask', [None])[i] if batch.get('polyline_mask') is not None else None,
+                            'batch_idx': batch_idx,
+                            'sample_id': i  # 배치 내 샘플 ID
+                        }
+                        
+                        # polyline_mask 처리
+                        if sample_data['polyline_mask'] is not None:
+                            sample_data['polyline_mask'] = sample_data['polyline_mask'].cpu()
+                        
+                        self.fixed_samples.append(sample_data)
+                        print(f"📌 고정 샘플 {len(self.fixed_samples)} 수집 완료 (batch: {batch_idx}, sample: {i})")
+                    
+                    self.samples_initialized = True
+                    print(f"✅ 배치 {batch_idx}에서 {len(self.fixed_samples)}개 고정 샘플 수집 완료 - 모든 에포크에서 동일한 샘플 사용")
+                        
+                except Exception as e:
+                    print(f"⚠️ 고정 샘플 수집 중 오류: {e}")
         
-        # 샘플 수 제한
-        if len(self.current_epoch_samples) >= self.max_samples_per_epoch:
-            return
-        
-        try:
-            # 배치에서 첫 번째 샘플만 저장 (메모리 절약)
-            sample_data = {
-                'image': batch['image'][0].cpu(),  # [3, H, W]
-                'target_coords': batch['coord_px'][0].cpu(),  # [2, 2]
-                'polyline_mask': batch.get('polyline_mask', [None])[0],  # [H, W] or None
-                'batch_idx': batch_idx,
-                'epoch': current_epoch
-            }
-            
-            # polyline_mask 처리
-            if sample_data['polyline_mask'] is not None:
-                sample_data['polyline_mask'] = sample_data['polyline_mask'].cpu()
-            
-            self.current_epoch_samples.append(sample_data)
-            
-        except Exception as e:
-            print(f"⚠️ 샘플 수집 중 오류: {e}")
+        # 2. 시각화 에포크에서는 고정 샘플을 사용
+        if (current_epoch + 1) % self.save_every_n_epochs == 0 and self.samples_initialized:
+            if not self.current_epoch_samples:  # 이미 설정되지 않은 경우에만
+                self.current_epoch_samples = self.fixed_samples.copy()
+                print(f"🔄 에포크 {current_epoch}: 고정 샘플 {len(self.current_epoch_samples)}개 사용")
     
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         """학습 에포크 종료 시 시각화 실행"""
@@ -358,9 +370,13 @@ class TrainingVisualizerCallback(Callback):
                 heatmap_dir = os.path.join(self.save_dir, "heatmaps")
                 os.makedirs(heatmap_dir, exist_ok=True)
                 
+                # 고정 샘플 정보 추가
+                sample_id = sample_data.get('sample_id', sample_idx)
+                batch_id = sample_data.get('batch_idx', 'unknown')
+                
                 heatmap_save_path = os.path.join(
                     heatmap_dir, 
-                    f"epoch_{epoch:03d}_sample_{sample_idx}_heatmap.png"
+                    f"epoch_{epoch:03d}_fixed_sample_{sample_id}_batch_{batch_id}_heatmap.png"
                 )
                 
                 # 폴리라인 마스크 준비 (있는 경우)
@@ -398,7 +414,7 @@ class TrainingVisualizerCallback(Callback):
                         activations_base_dir = os.path.join(self.save_dir, "activations")
                         os.makedirs(activations_base_dir, exist_ok=True)
                         
-                        activation_save_dir = os.path.join(activations_base_dir, f"epoch_{epoch:03d}_sample_{sample_idx}")
+                        activation_save_dir = os.path.join(activations_base_dir, f"epoch_{epoch:03d}_fixed_sample_{sample_id}_batch_{batch_id}")
                         os.makedirs(activation_save_dir, exist_ok=True)
                         
                         print(f"🎨 CNN 시각화 시작: {key_layers}")
@@ -407,7 +423,7 @@ class TrainingVisualizerCallback(Callback):
                             input_tensor=image_tensor,
                             layer_names=key_layers,
                             save_dir=activation_save_dir,
-                            save_prefix=f"epoch_{epoch}_sample_{sample_idx}"
+                            save_prefix=f"epoch_{epoch}_fixed_sample_{sample_id}"
                         )
                         print(f"✅ CNN 시각화 완료: {len(key_layers)}개 레이어")
                     else:
@@ -426,7 +442,7 @@ class TrainingVisualizerCallback(Callback):
                 
                 comparison_save_path = os.path.join(
                     comparison_dir,
-                    f"epoch_{epoch:03d}_sample_{sample_idx}_comparison.png"
+                    f"epoch_{epoch:03d}_fixed_sample_{sample_id}_batch_{batch_id}_comparison.png"
                 )
                 self._create_simple_comparison(
                     image_np, pred_coords, target_coords, comparison_save_path, epoch, sample_idx
