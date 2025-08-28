@@ -229,7 +229,7 @@ def coordinate_huber_loss(pred_coords: torch.Tensor, target_coords: torch.Tensor
     # 평균 계산 (모든 배치, 점, 축에 대해)
     return huber_loss.mean()
 
-def separation_hinge_loss(pred_coords: torch.Tensor, min_distance: float = 5.0) -> torch.Tensor:
+def separation_hinge_loss(pred_coords: torch.Tensor, min_distance: float = 20.0) -> torch.Tensor:
     """
     두 키포인트 간 최소 거리 보장을 위한 힌지 손실
     

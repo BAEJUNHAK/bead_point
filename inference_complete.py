@@ -14,7 +14,7 @@ from pathlib import Path
 # 프로젝트 모듈 임포트
 from src.models.lit_model import LitKeypoint2
 from src.models.img_backbone import DWUNetTiny
-from src.losses.heatmap_utils import heatmaps_to_coords_argmax
+from src.losses.heatmap_utils import softargmax_2d
 from src.utils.viz import save_overlay
 
 
@@ -31,7 +31,7 @@ class BeadPointInference:
         
         # 새로운 손실 시스템 파라미터
         self.model_params = {
-            "img_size": 256,  # hparams.yaml에서 확인
+            "img_size": 256,  # train_img.py에서 기본값 확인 (size=512)
             "sigma": 3.0,     # 새로운 권장값: 3px (기존 5.0에서 변경)
             "sigma_polyline": 3.0,
             "polyline_weight": 0.3,
@@ -43,7 +43,7 @@ class BeadPointInference:
             # 새로운 손실 시스템 파라미터
             "lambda_heatmap": 1.0,     # 히트맵 MSE 가중치
             "lambda_coord": 0.2,       # 좌표 Huber 가중치
-            "lambda_separation": 0.0,  # 분리 힌지 가중치 (기본: 비활성화)
+            "lambda_separation": 0.05,  # 분리 힌지 가중치 (기본: 비활성화)
             "huber_delta": 2.0,        # Huber 전환점 (2px)
             "min_separation": 5.0,     # 최소 분리 거리 (5px)
             "temperature": 0.02        # soft-argmax 온도 (0.02)
@@ -67,7 +67,7 @@ class BeadPointInference:
     
     def _find_best_checkpoint(self) -> str:
         """최적 체크포인트 자동 찾기 (가장 낮은 validation MAE)"""
-        ckpt_dir = "runs/ckpts"
+        ckpt_dir = "runs/ckpts1"
         if not os.path.exists(ckpt_dir):
             raise FileNotFoundError(f"체크포인트 디렉토리를 찾을 수 없습니다: {ckpt_dir}")
         
@@ -168,8 +168,17 @@ class BeadPointInference:
         model.load_state_dict(clean_state_dict, strict=False)
         return model
     
-    def preprocess_image(self, image_path: str) -> torch.Tensor:
-        """이미지 전처리"""
+    def preprocess_image(self, image_path: str, pkl_path: str = None) -> torch.Tensor:
+        """
+        이미지 전처리 - 학습 데이터셋과 동일한 전처리 적용
+        
+        Args:
+            image_path: 입력 이미지 경로
+            pkl_path: PKL 파일 경로 (제약조건 적용시 필요)
+        """
+        from src.data.dataset_img import detect_blue_roi, blue_mask_roi, load_points_from_pkl_raw, best_flip_from_polyline, map_with_range
+        from torchvision.transforms.functional import to_tensor
+        
         # 이미지 로드
         img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -178,49 +187,192 @@ class BeadPointInference:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         H0, W0 = img_rgb.shape[:2]
         
-        # 리사이즈 (모델 입력 크기에 맞춤)
+        # Blue ROI 검출 (학습과 동일)
+        roi = detect_blue_roi(img_bgr, blue_min=70, diff_min=30)  # 학습 시 사용한 파라미터
+        mask_roi = blue_mask_roi(img_bgr, roi, blue_min=70, diff_min=30)
+        
+        # PKL 폴리라인을 이용한 데이터 범위 및 flip 결정 (학습과 동일)
+        flip_x, flip_y, data_range = False, False, (0, W0, 0, H0)  # 기본값
+        if pkl_path and os.path.exists(pkl_path):
+            try:
+                poly = load_points_from_pkl_raw(pkl_path)
+                flip_x, flip_y, data_range = best_flip_from_polyline(poly, roi, mask_roi)
+            except Exception as e:
+                print(f"⚠️ PKL 처리 실패, 기본값 사용: {e}")
+        
+        # 리사이즈 (학습과 동일)
         size = self.model_params["img_size"]
         img_resized = cv2.resize(img_rgb, (size, size), interpolation=cv2.INTER_AREA)
         
-        # 정규화 및 텐서 변환
-        img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0
+        # 정규화 및 텐서 변환 (학습과 동일: to_tensor 사용)
+        img_tensor = to_tensor(img_resized)  # 자동으로 0-255 → 0-1 변환
         img_tensor = img_tensor.unsqueeze(0)  # 배치 차원 추가 [1, 3, H, W]
         
-        # 스케일 팩터 저장 (후처리용)
+        # 스케일 팩터 계산 (원본 → 리사이즈)
         scale_x = W0 / size
         scale_y = H0 / size
         
-        return img_tensor.to(self.device), (scale_x, scale_y), (H0, W0)
+        return img_tensor.to(self.device), (scale_x, scale_y), (H0, W0), {
+            "roi": roi,
+            "flip": (flip_x, flip_y), 
+            "data_range": data_range,
+            "orig_size": (H0, W0)
+        }
     
-    def predict(self, image_path: str, use_constraint: bool = True) -> dict:
+    def _create_polyline_mask_for_inference(self, pkl_path: str, preprocess_info: dict) -> torch.Tensor:
+        """
+        추론용 폴리라인 마스크 생성 (학습 데이터셋과 동일한 방식)
+        
+        Args:
+            pkl_path: PKL 파일 경로
+            preprocess_info: 전처리 정보 (ROI, flip, data_range)
+            
+        Returns:
+            [1, H, W] 폴리라인 마스크 텐서 (실패시 None)
+        """
+        try:
+            from src.data.dataset_img import load_points_from_pkl_raw, map_with_range
+            
+            # PKL에서 폴리라인 로드
+            poly = load_points_from_pkl_raw(pkl_path)
+            
+            # 전처리 정보 추출
+            roi = preprocess_info["roi"]
+            flip_x, flip_y = preprocess_info["flip"]
+            data_range = preprocess_info["data_range"]
+            
+            # 폴리라인을 픽셀 좌표로 변환 (전처리와 동일)
+            poly_px = map_with_range(poly, roi, data_range, flip_x, flip_y)
+            
+            # 리사이즈 스케일 적용
+            size = self.model_params["img_size"]
+            orig_h, orig_w = preprocess_info.get("orig_size", (roi[3]-roi[1], roi[2]-roi[0]))
+            sx, sy = size / float(orig_w), size / float(orig_h)
+            poly_r = poly_px.copy()
+            poly_r[:,0] *= sx
+            poly_r[:,1] *= sy
+            
+            # 폴리라인 마스크 생성 (학습 데이터셋과 동일)
+            mask = self._create_polyline_mask(poly_r, size, size)
+            
+            # 텐서로 변환하고 배치 차원 추가
+            mask_tensor = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)  # [1, H, W]
+            return mask_tensor.to(self.device)
+            
+        except Exception as e:
+            print(f"❌ 폴리라인 마스크 생성 실패: {e}")
+            return None
+    
+    def _create_polyline_mask(self, polyline_points: np.ndarray, H: int, W: int, thickness: int = 8) -> np.ndarray:
+        """
+        폴리라인을 따라 마스크 생성 - 키포인트 제약조건 (학습 데이터셋과 동일)
+        
+        Args:
+            polyline_points: [N, 2] 폴리라인 포인트들
+            H, W: 마스크 크기
+            thickness: 라인 두께 (기본값을 8로 증가)
+            
+        Returns:
+            [H, W] 마스크 (0 또는 1)
+        """
+        mask = np.zeros((H, W), dtype=np.uint8)
+        
+        if len(polyline_points) < 2:
+            print("⚠️ 폴리라인 포인트가 너무 적음")
+            return mask.astype(np.float32)
+        
+        # 폴리라인을 이미지에 그리기
+        pts = polyline_points.astype(np.int32)
+        pts = np.clip(pts, 0, [W-1, H-1])  # 이미지 경계 내로 제한
+        
+        # 연결선 그리기
+        for i in range(len(pts)-1):
+            cv2.line(mask, tuple(pts[i]), tuple(pts[i+1]), 255, thickness)
+        
+        # 각 폴리라인 점 주변도 마킹 (점 끝부분 보강)
+        for pt in pts:
+            cv2.circle(mask, tuple(pt), thickness//2 + 2, 255, -1)
+        
+        # 마스크 확장 (morphology)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        
+        result_mask = (mask > 0).astype(np.float32)
+        
+        # 마스크 유효성 검사
+        mask_pixels = np.sum(result_mask)
+        total_pixels = H * W
+        print(f"🔍 생성된 마스크: {mask_pixels:.0f}/{total_pixels} 픽셀 ({mask_pixels/total_pixels*100:.1f}%)")
+        
+        return result_mask
+    
+    def predict(self, image_path: str, pkl_path: str = None, use_constraint: bool = True, force_constraint: bool = False) -> dict:
         """
         단일 이미지에 대한 키포인트 예측
         
         Args:
             image_path: 입력 이미지 경로
+            pkl_path: PKL 파일 경로 (제약조건 적용시 필요)
             use_constraint: 폴리라인 제약조건 사용 여부
+            force_constraint: 제약조건 강제 적용 (마스크가 작아도 적용)
             
         Returns:
             예측 결과 딕셔너리
         """
+        # PKL 경로 자동 추정
+        if pkl_path is None:
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            pkl_candidates = [
+                os.path.join(os.path.dirname(image_path), "..", "pkl", f"{base_name}.pkl"),  # 상위 폴더의 pkl 디렉토리
+                os.path.join(os.path.dirname(image_path), "pkl", f"{base_name}.pkl"),      # 같은 폴더의 pkl 디렉토리
+                os.path.join(os.path.dirname(image_path), f"{base_name}.pkl"),            # 같은 폴더
+            ]
+            for candidate in pkl_candidates:
+                if os.path.exists(candidate):
+                    pkl_path = candidate
+                    break
+        
         with torch.no_grad():
-            # 전처리
-            img_tensor, (scale_x, scale_y), (orig_h, orig_w) = self.preprocess_image(image_path)
+            # 전처리 (학습과 동일)
+            img_tensor, (scale_x, scale_y), (orig_h, orig_w), preprocess_info = self.preprocess_image(image_path, pkl_path)
             
             # 모델 추론
             logits = self.model(img_tensor)  # [1, 2, H, W]
             
-            if use_constraint:
-                # 폴리라인 제약조건이 있다면 적용
-                # 실제 데이터에서는 PKL 파일이나 폴리라인 마스크가 필요
-                # 여기서는 제약 없이 진행
-                print("⚠️ 폴리라인 제약조건을 위해서는 PKL 파일이 필요합니다.")
+            # 폴리라인 제약조건 적용 (학습과 동일)
+            polyline_mask = None
+            if use_constraint and pkl_path and os.path.exists(pkl_path):
+                print(f"✅ PKL 파일 사용: {pkl_path}")
+                print(f"📊 전처리 정보: ROI={preprocess_info['roi']}, Flip={preprocess_info['flip']}")
+                
+                # 폴리라인 마스크 생성 (학습 데이터셋과 동일한 방식)
+                polyline_mask = self._create_polyline_mask_for_inference(pkl_path, preprocess_info)
+                if polyline_mask is not None:
+                    # 마스크 유효성 검사
+                    mask_sum = polyline_mask.sum().item()
+                    total_pixels = polyline_mask.numel()
+                    mask_ratio = mask_sum / total_pixels
+                    print(f"📊 마스크 통계: {mask_sum:.0f}/{total_pixels} 픽셀 ({mask_ratio*100:.1f}%)")
+                    
+                    if mask_ratio > 0.01 or force_constraint:  # 마스크가 충분하거나 강제 적용
+                        # 폴리라인 영역만 활성화 (학습/평가와 동일)
+                        masked_logits = logits * polyline_mask.unsqueeze(1)  # [1,1,H,W] -> [1,2,H,W]
+                        probs = torch.sigmoid(masked_logits)
+                        constraint_type = "강제 적용" if force_constraint and mask_ratio <= 0.01 else "정상 적용"
+                        print(f"🎯 폴리라인 제약조건 {constraint_type}")
+                    else:
+                        print("⚠️ 마스크가 너무 작음 - 제약조건 미적용")
+                        probs = torch.sigmoid(logits)
+                        polyline_mask = None
+                else:
+                    probs = torch.sigmoid(logits)
+                    print("⚠️ 폴리라인 마스크 생성 실패 - 제약조건 미적용")
+            else:
+                print("⚠️ PKL 파일 없음 - 제약조건 미적용")
+                probs = torch.sigmoid(logits)
             
-            # 확률로 변환
-            probs = torch.sigmoid(logits)
-            
-            # 좌표 추출 (argmax 방식)
-            coords_pred = heatmaps_to_coords_argmax(probs)  # [1, 2, 2]
+            # 좌표 추출 (softargmax 방식 - 학습과 동일)
+            coords_pred = softargmax_2d(probs, temperature=self.model_params["temperature"])  # [1, 2, 2]
             coords_pred = coords_pred[0].cpu().numpy()  # [2, 2]
             
             # 원본 이미지 크기로 스케일 복원
@@ -230,18 +382,23 @@ class BeadPointInference:
             # 결과 정리
             result = {
                 "image_path": image_path,
+                "pkl_path": pkl_path,
                 "keypoints": coords_pred,  # [[x1, y1], [x2, y2]]
                 "point1": coords_pred[0],  # [x1, y1] 
                 "point2": coords_pred[1],  # [x2, y2]
                 "original_size": (orig_w, orig_h),
                 "confidence_maps": probs[0].cpu().numpy(),  # [2, H, W]
-                "scale_factors": (scale_x, scale_y)
+                "scale_factors": (scale_x, scale_y),
+                "preprocess_info": preprocess_info,
+                # 폴리라인 마스크 추가 (시각화용)
+                "polyline_mask": polyline_mask[0].cpu().numpy() if polyline_mask is not None else None
             }
             
             return result
     
     def predict_folder(self, input_dir: str, output_dir: str, 
-                      save_overlay: bool = True, save_csv: bool = True, max_images: int = 20) -> list:
+                      save_overlay: bool = True, save_csv: bool = True, max_images: int = 20,
+                      enable_visualization: bool = False) -> list:
         """
         폴더 내 이미지에 대한 배치 예측 (제한된 개수)
         
@@ -251,6 +408,7 @@ class BeadPointInference:
             save_overlay: 오버레이 이미지 저장 여부
             save_csv: CSV 결과 저장 여부
             max_images: 처리할 최대 이미지 개수 (기본값: 20)
+            enable_visualization: 고급 시각화 기능 활성화 여부
             
         Returns:
             예측 결과 리스트
@@ -279,11 +437,21 @@ class BeadPointInference:
         
         all_results = []
         
+        # 고급 시각화 도구 초기화 (요청시)
+        viz_manager = None
+        if enable_visualization:
+            try:
+                from src.utils.training_visualizer import VisualizationManager
+                viz_manager = VisualizationManager(save_dir=os.path.join(output_dir, "visualizations"))
+                print("✅ 고급 시각화 모드 활성화")
+            except Exception as e:
+                print(f"⚠️ 시각화 도구 초기화 실패: {e}")
+        
         for i, img_path in enumerate(image_files):
             print(f"🔄 처리중 ({i+1}/{len(image_files)}): {os.path.basename(img_path)}")
             
             try:
-                # 예측 수행
+                # 예측 수행 (PKL 파일 자동 검색 포함)
                 result = self.predict(img_path)
                 all_results.append(result)
                 
@@ -299,11 +467,34 @@ class BeadPointInference:
                     overlay_path = os.path.join(output_dir, f"{base_name}_overlay.png")
                     self._save_overlay_image(img_path, result, overlay_path)
                 
+                # 고급 시각화 (요청시)
+                if viz_manager is not None:
+                    try:
+                        viz_files = viz_manager.visualize_inference_results(
+                            model=self.model,
+                            image_path=img_path,
+                            result=result,
+                            save_prefix=base_name
+                        )
+                        if viz_files:
+                            print(f"🎨 고급 시각화 저장: {len(viz_files)}개 파일")
+                    except Exception as e:
+                        print(f"⚠️ 고급 시각화 실패 {base_name}: {e}")
+                
             except Exception as e:
                 print(f"❌ 오류 발생 {os.path.basename(img_path)}: {e}")
                 continue
         
         print(f"✅ 배치 처리 완료: {len(all_results)}/{len(image_files)} 성공")
+        
+        # 배치 요약 시각화 (고급 시각화 모드일 때)
+        if viz_manager is not None and all_results:
+            try:
+                summary_path = viz_manager.create_batch_summary(all_results)
+                print(f"📊 배치 요약 시각화 생성: {summary_path}")
+            except Exception as e:
+                print(f"⚠️ 배치 요약 생성 실패: {e}")
+        
         return all_results
     
     def _save_overlay_image(self, original_path: str, result: dict, save_path: str):
@@ -355,6 +546,8 @@ def main():
                        help="CSV 결과 저장")
     parser.add_argument("--max_images", type=int, default=20,
                        help="폴더 배치 처리시 최대 이미지 개수 (기본값: 20)")
+    parser.add_argument("--enable_visualization", action="store_true",
+                       help="고급 시각화 기능 활성화 (CNN activation, 히트맵 분석 등)")
     
     args = parser.parse_args()
     
@@ -409,7 +602,8 @@ def main():
                 args.input, args.output, 
                 save_overlay=args.save_overlay,
                 save_csv=args.save_csv,
-                max_images=args.max_images
+                max_images=args.max_images,
+                enable_visualization=args.enable_visualization
             )
             
             # 전체 통계

@@ -115,7 +115,7 @@ class LitKeypoint2(pl.LightningModule):
         masked_logit = logit * polyline_mask.unsqueeze(1)  # [B,1,H,W] -> [B,2,H,W]
         prob = torch.sigmoid(masked_logit)
         
-        # 3. 단순한 가우시안 히트맵 생성 (폴리라인 정보 제외)
+        # 3. 단순한 가우시안 히트맵 생성 (키포인트만)
         target = make_heatmaps_torch(gt, H, W, self.sigma)  # [B,2,H,W]
         
         # 4. 타겟 히트맵도 폴리라인 영역에만 제한
@@ -168,7 +168,7 @@ class LitKeypoint2(pl.LightningModule):
         masked_logit = logit * polyline_mask.unsqueeze(1)  # [B,1,H,W] -> [B,2,H,W]
         prob = torch.sigmoid(masked_logit)
         
-        # 3. 단순한 가우시안 히트맵 생성 (폴리라인 정보 제외)
+        # 3. 단순한 가우시안 히트맵 생성 (키포인트만)
         target = make_heatmaps_torch(gt, H, W, self.sigma)  # [B,2,H,W]
         
         # 4. 타겟 히트맵도 폴리라인 영역에만 제한

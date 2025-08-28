@@ -5,3 +5,10 @@ opencv-python==4.7.0.72
 numpy==1.21.6
 onnx==1.14.1
 onnxruntime==1.15.1
+
+# 시각화 관련 패키지
+matplotlib
+seaborn
+scipy
+Pillow
+imageio
