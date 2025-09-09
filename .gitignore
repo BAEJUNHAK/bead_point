@@ -146,7 +146,18 @@ dmypy.json
 *.bmp
 *.tiff
 
-/test_left/
+/test_left1/
+*.ckpt
+*.pth
+*.onnx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+/test_left1+/
 *.ckpt
 *.pth
 *.onnx
@@ -168,7 +179,7 @@ dmypy.json
 *.bmp
 *.tiff
 
-/test_left3/
+/test_left2+/
 *.ckpt
 *.pth
 *.onnx
@@ -179,7 +190,29 @@ dmypy.json
 *.bmp
 *.tiff
 
-/test_left4/
+/test_right1/
+*.ckpt
+*.pth
+*.onnx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+/test_right1+/
+*.ckpt
+*.pth
+*.onnx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+/test_right2+/
 *.ckpt
 *.pth
 *.onnx

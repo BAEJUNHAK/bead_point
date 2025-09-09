@@ -430,8 +430,8 @@ class BeadPointInference:
         
         # 최대 개수로 제한
         if len(image_files) > max_images:
-            image_files = image_files[:max_images]
-            print(f"⚡ 처리 개수를 {max_images}개로 제한")
+            image_files = image_files[:max_images]  # 뒤에서부터 max_images개 선택
+            print(f"⚡ 처리 개수를 {max_images}개로 제한 (하위 부분)")
         
         print(f"🔄 실제 처리할 이미지: {len(image_files)}개")
         

@@ -34,7 +34,7 @@ def parse_args():
     ap.add_argument("--min_separation", type=float, default=5.0, help="최소 분리 거리 (픽셀)")
     ap.add_argument("--temperature", type=float, default=0.02, help="soft-argmax 온도 파라미터")
 
-    ap.add_argument("--val_ratio", type=float, default=0.2, help="train/val 분할 비율")
+    ap.add_argument("--val_ratio", type=float, default=0.20, help="train/val 분할 비율")
     ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--devices", default="auto")
