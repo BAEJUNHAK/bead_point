@@ -51,9 +51,11 @@ def main():
 
             logit = model(img)
             
-            # 폴리라인 영역만 활성화 (제약조건 적용)
-            masked_logit = logit * polyline_mask.unsqueeze(1)
-            prob = torch.sigmoid(masked_logit)
+            # 폴리라인 영역만 활성화 (제약조건 적용) - 수정됨
+            mask_expanded = polyline_mask.unsqueeze(1).expand_as(logit)  # [B,1,H,W] -> [B,2,H,W]
+            masked_logit = logit.clone()
+            masked_logit[mask_expanded == 0] = -float('inf')  # 마스크 외부를 -inf로
+            prob = torch.sigmoid(masked_logit)  # sigmoid(-inf) = 0
 
             # argmax (훈련과 동일한 방식)
             pred = heatmaps_to_coords_argmax(prob).cpu()  # [B,2,2]

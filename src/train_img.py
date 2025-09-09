@@ -34,8 +34,19 @@ def parse_args():
     ap.add_argument("--min_separation", type=float, default=5.0, help="최소 분리 거리 (픽셀)")
     ap.add_argument("--temperature", type=float, default=0.02, help="soft-argmax 온도 파라미터")
 
+    # 옵티마이저 관련 파라미터
+    ap.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"], 
+                    help="옵티마이저 선택")
+    ap.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay 값")
+
     ap.add_argument("--val_ratio", type=float, default=0.20, help="train/val 분할 비율")
     ap.add_argument("--seed", type=int, default=42)
+
+    # 데이터 증강 관련 옵션 (기본: 활성화)
+    ap.add_argument("--no_augmentation", action="store_true",
+                    help="데이터 증강 비활성화")
+    ap.add_argument("--augmentation_strength", type=float, default=1.0,
+                    help="데이터 증강 강도 (0.0~1.0)")
 
     ap.add_argument("--devices", default="auto")
     ap.add_argument("--precision", default="16-mixed")
@@ -58,18 +69,60 @@ def parse_args():
 
 
 def build_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
-    ds = BeadImageKeypointDataset(
+    # 전체 데이터셋 생성 (training=True, 증강 활성화)
+    full_ds = BeadImageKeypointDataset(
         img_dir=args.train_img,
         pkl_dir=args.train_pkl,
         size=args.size,
         annotation_csv=args.ann_csv,
         auto_blue_min=70,
         auto_diff_min=30,
+        enable_augmentation=True,
+        augmentation_strength=1.0,
+        training=True,
     )
-    val_len = max(1, int(len(ds) * args.val_ratio))
-    train_len = len(ds) - val_len
+    
+    # train/val 분할
+    val_len = max(1, int(len(full_ds) * args.val_ratio))
+    train_len = len(full_ds) - val_len
     gen = torch.Generator().manual_seed(args.seed)
-    tr_ds, va_ds = random_split(ds, [train_len, val_len], generator=gen)
+    train_indices, val_indices = random_split(range(len(full_ds)), [train_len, val_len], generator=gen)
+    
+    # 증강 설정 결정 (기본: 활성화, --no_augmentation이 있으면 비활성화)
+    enable_aug = not args.no_augmentation
+    aug_strength = args.augmentation_strength if enable_aug else 0.0
+    
+    # 각각 별도 데이터셋으로 생성
+    # Training 데이터셋 (증강 활성화)
+    tr_ds = BeadImageKeypointDataset(
+        img_dir=args.train_img,
+        pkl_dir=args.train_pkl,
+        size=args.size,
+        annotation_csv=args.ann_csv,
+        auto_blue_min=70,
+        auto_diff_min=30,
+        enable_augmentation=enable_aug,
+        augmentation_strength=aug_strength,
+        training=True,
+    )
+    
+    # Validation 데이터셋 (증강 비활성화)
+    va_ds = BeadImageKeypointDataset(
+        img_dir=args.train_img,
+        pkl_dir=args.train_pkl,
+        size=args.size,
+        annotation_csv=args.ann_csv,
+        auto_blue_min=70,
+        auto_diff_min=30,
+        enable_augmentation=False,  # 검증 시 항상 증강 비활성화
+        augmentation_strength=0.0,
+        training=False,
+    )
+    
+    # Subset으로 인덱스 제한
+    from torch.utils.data import Subset
+    tr_ds = Subset(tr_ds, train_indices.indices)
+    va_ds = Subset(va_ds, val_indices.indices)
 
     tr = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,
                     num_workers=args.num_workers, pin_memory=True, persistent_workers=True, 
@@ -120,6 +173,26 @@ class PersistConsole(pl.Callback):
         pl.utilities.rank_zero_info(line)
 
 
+class AugmentationStatsCallback(pl.Callback):
+    """데이터 증강 통계를 출력하는 콜백"""
+    
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # 에폭 시작 시 통계 리셋
+        from src.data.augmentation import reset_augmentation_stats
+        reset_augmentation_stats()
+    
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # 에폭 끝에 통계 출력 (5 에폭마다만)
+        if (trainer.current_epoch + 1) % 5 == 0:
+            try:
+                from src.data.augmentation import print_augmentation_summary, get_augmentation_stats
+                stats = get_augmentation_stats()
+                if stats.get('total_samples', 0) > 0:
+                    print_augmentation_summary(trainer.current_epoch + 1)
+            except Exception:
+                pass  # 조용히 실패
+
+
 def make_callbacks(args) -> List[pl.Callback]:
     cbs: List[pl.Callback] = []
 
@@ -153,6 +226,9 @@ def make_callbacks(args) -> List[pl.Callback]:
     # 에폭별 고정 로그
     if args.persist_console:
         cbs.append(PersistConsole())
+    
+    # 데이터 증강 통계 콜백 추가 (항상 추가)
+    cbs.append(AugmentationStatsCallback())
     
     # 무조건 시각화 콜백 추가 (내장 도구로 완전 해결)
     from src.utils.training_visualizer import TrainingVisualizerCallback
@@ -210,6 +286,11 @@ Loss Config:
 - lambda_coord: {args.lambda_coord}
 - lambda_separation: {args.lambda_separation}
 - temperature: {args.temperature}
+
+Optimizer Config:
+- optimizer: {args.optimizer}
+- weight_decay: {args.weight_decay}
+- lr: {args.lr}
 """
         
         config_path = os.path.join(save_dir, "training_config.txt")
@@ -245,6 +326,13 @@ def main():
 
     tr, va = build_dataloaders(args)
     
+    # 증강 설정 로그
+    enable_aug = not args.no_augmentation
+    if enable_aug:
+        print(f"✅ 데이터 증강 활성화 (강도: {args.augmentation_strength:.1f})")
+    else:
+        print("❌ 데이터 증강 비활성화")
+    
     # log_every_n_steps를 훈련 배치 수에 맞게 자동 조정
     train_batches = len(tr)
     effective_log_steps = min(args.log_every_n_steps, max(1, train_batches // 4))
@@ -262,7 +350,11 @@ def main():
         lambda_separation=args.lambda_separation,
         huber_delta=args.huber_delta,
         min_separation=args.min_separation,
-        temperature=args.temperature
+        temperature=args.temperature,
+        # 옵티마이저 관련 파라미터들
+        optimizer_type=args.optimizer,
+        weight_decay=args.weight_decay,
+        max_epochs=args.max_epochs
     )
 
     # 로거 디렉토리 미리 생성

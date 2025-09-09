@@ -244,10 +244,20 @@ class BeadPointInference:
             # 폴리라인을 픽셀 좌표로 변환 (전처리와 동일)
             poly_px = map_with_range(poly, roi, data_range, flip_x, flip_y)
             
-            # 리사이즈 스케일 적용
+            # 리사이즈 스케일 적용 (학습과 동일하게 원본 이미지 크기 기준)
             size = self.model_params["img_size"]
-            orig_h, orig_w = preprocess_info.get("orig_size", (roi[3]-roi[1], roi[2]-roi[0]))
+            
+            # 🔧 핵심 수정: 원본 이미지 크기 기준으로 스케일 계산 (학습과 일치)
+            if "orig_size" in preprocess_info:
+                orig_h, orig_w = preprocess_info["orig_size"]  # 원본 이미지 크기 사용
+                print(f"🔍 원본 이미지 크기 사용: {orig_w}x{orig_h}")
+            else:
+                # 백업: ROI 크기 사용 (하지만 경고 출력)
+                orig_h, orig_w = roi[3]-roi[1], roi[2]-roi[0]
+                print(f"⚠️ 백업: ROI 크기 사용: {orig_w}x{orig_h} (정확하지 않을 수 있음)")
+            
             sx, sy = size / float(orig_w), size / float(orig_h)
+            print(f"🔍 스케일 팩터: sx={sx:.4f}, sy={sy:.4f}")
             poly_r = poly_px.copy()
             poly_r[:,0] *= sx
             poly_r[:,1] *= sy
@@ -263,7 +273,7 @@ class BeadPointInference:
             print(f"❌ 폴리라인 마스크 생성 실패: {e}")
             return None
     
-    def _create_polyline_mask(self, polyline_points: np.ndarray, H: int, W: int, thickness: int = 12) -> np.ndarray:
+    def _create_polyline_mask(self, polyline_points: np.ndarray, H: int, W: int, thickness: int = 8) -> np.ndarray:
         """
         폴리라인을 따라 마스크 생성 - 키포인트 제약조건 (학습 데이터셋과 동일)
         
@@ -292,6 +302,10 @@ class BeadPointInference:
         # 각 폴리라인 점 주변도 마킹 (점 끝부분 보강)
         for pt in pts:
             cv2.circle(mask, tuple(pt), thickness//2 + 2, 255, -1)
+        
+        # 마스크 확장 (morphology)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(mask, kernel, iterations=1)
         
         result_mask = (mask > 0).astype(np.float32)
         
@@ -351,7 +365,7 @@ class BeadPointInference:
                     print(f"📊 마스크 통계: {mask_sum:.0f}/{total_pixels} 픽셀 ({mask_ratio*100:.1f}%)")
                     
                     if mask_ratio > 0.01 or force_constraint:  # 마스크가 충분하거나 강제 적용
-                        # 🔧 올바른 폴리라인 제약조건 적용
+                        # 🔧 올바른 폴리라인 제약조건 적용 (학습/평가와 동일)
                         # 마스크 외부 영역을 큰 음수로 설정하여 sigmoid 후 0에 가깝게 만듦
                         mask_expanded = polyline_mask.unsqueeze(1).expand_as(logits)  # [1,1,H,W] -> [1,2,H,W]
                         masked_logits = logits.clone()
@@ -369,29 +383,6 @@ class BeadPointInference:
                         nonmask_area_prob = probs[polyline_mask.unsqueeze(1).expand_as(probs) == 0].mean().item() if (polyline_mask == 0).any() else 0
                         print(f"🔬 마스킹 후: 비영 영역={nonzero_ratio*100:.1f}%, 최대확률={max_prob:.4f}")
                         print(f"🔬 확률 분포: 마스크내평균={mask_area_prob:.6f}, 마스크외평균={nonmask_area_prob:.6f}, 최소값={min_prob:.6f}")
-                        
-                        # 🚨 마스크 적용 검증
-                        print(f"🔍 마스크 적용 전 로짓 범위: [{logits.min().item():.3f}, {logits.max().item():.3f}]")
-                        print(f"🔍 마스크 적용 후 로짓 범위: [{masked_logits.min().item():.3f}, {masked_logits.max().item():.3f}]")
-                        
-                        # 마스크 외부가 정말 -inf인지 확인
-                        mask_outside_logits = masked_logits[mask_expanded == 0]
-                        if len(mask_outside_logits) > 0:
-                            print(f"🔍 마스크 외부 로짓 값 (샘플): {mask_outside_logits[:5].tolist()}")
-                        
-                        # 🚨 최대값 위치 확인 (argmax 결과 미리보기)
-                        for ch in range(2):
-                            ch_probs = probs[0, ch]  # [H, W]
-                            max_indices = torch.where(ch_probs == ch_probs.max())
-                            max_y, max_x = max_indices[0][0].item(), max_indices[1][0].item()
-                            is_in_mask = polyline_mask[0, max_y, max_x].item() > 0
-                            print(f"🎯 채널{ch} 최대값 위치: ({max_x}, {max_y}), 마스크내부: {'✅' if is_in_mask else '❌'}, 확률: {ch_probs.max().item():.6f}")
-                            
-                            # 마스크 외부에 0이 아닌 값이 있는지 확인
-                            ch_mask_outside = ch_probs[polyline_mask[0] == 0]
-                            if len(ch_mask_outside) > 0:
-                                outside_max = ch_mask_outside.max().item()
-                                print(f"🚨 채널{ch} 마스크 외부 최대확률: {outside_max:.6f}")
                     else:
                         print("⚠️ 마스크가 너무 작음 - 제약조건 미적용")
                         probs = torch.sigmoid(logits)
@@ -403,7 +394,7 @@ class BeadPointInference:
                 print("⚠️ PKL 파일 없음 - 제약조건 미적용")
                 probs = torch.sigmoid(logits)
             
-            # 🎯 좌표 추출 방식 선택 (핵심 개선사항)
+            # 🎯 좌표 추출 방식 선택 (하이브리드 개선사항)
             if polyline_mask is not None:
                 # 마스킹된 경우: argmax 사용
                 # - 온도 파라미터(0.02)로 인한 수치적 불안정성 회피
@@ -502,7 +493,7 @@ class BeadPointInference:
                 
                 # CSV 저장
                 if save_csv:
-                    csv_path = os.path.join(output_dir, f"{base_name}.csv")
+                    csv_path = os.path.join(output_dir, f"{base_name}_pred.csv")
                     np.savetxt(csv_path, result["keypoints"], delimiter=",", fmt="%.2f")
                 
                 # 오버레이 이미지 저장

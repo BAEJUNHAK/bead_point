@@ -19,7 +19,9 @@ class LitKeypoint2(pl.LightningModule):
                  pck_thresh_px: float = 5.0, sigma_polyline: float = 3.0, polyline_weight: float = 0.3,
                  # 새로운 손실 시스템 파라미터
                  lambda_heatmap: float = 1.0, lambda_coord: float = 0.2, lambda_separation: float = 0.0,
-                 huber_delta: float = 2.0, min_separation: float = 5.0, temperature: float = 0.02):
+                 huber_delta: float = 2.0, min_separation: float = 5.0, temperature: float = 0.02,
+                 # 옵티마이저 관련 파라미터
+                 optimizer_type: str = "adamw", weight_decay: float = 0.01, max_epochs: int = 40):
         super().__init__()
         self.save_hyperparameters()
         self.net = DWUNetTiny(in_ch=3, base=64, out_ch=2) # 더 큰 모델 (64 base)
@@ -31,6 +33,11 @@ class LitKeypoint2(pl.LightningModule):
         self.polyline_weight = polyline_weight  # 폴리라인 히트맵 가중치
         self.lr = lr
         self.pck_thresh_px = pck_thresh_px
+        
+        # 옵티마이저 설정 저장
+        self.optimizer_type = optimizer_type
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
         
         # 새로운 손실 시스템
         self.loss_fn = NewKeypointLoss(
@@ -64,9 +71,11 @@ class LitKeypoint2(pl.LightningModule):
         
         # 마스크가 제공되면 제약조건 적용
         if polyline_mask is not None:
-            # 폴리라인 영역만 활성화
-            masked_logit = pred_logit * polyline_mask.unsqueeze(1)  # [B,1,H,W] -> [B,2,H,W]
-            prob = torch.sigmoid(masked_logit)
+            # 폴리라인 영역만 활성화 - 수정됨
+            mask_expanded = polyline_mask.unsqueeze(1).expand_as(pred_logit)  # [B,1,H,W] -> [B,2,H,W]
+            masked_logit = pred_logit.clone()
+            masked_logit[mask_expanded == 0] = -float('inf')  # 마스크 외부를 -inf로
+            prob = torch.sigmoid(masked_logit)  # sigmoid(-inf) = 0
         else:
             # 마스크가 없으면 기존 방식
             prob = torch.sigmoid(pred_logit)
@@ -164,9 +173,11 @@ class LitKeypoint2(pl.LightningModule):
         # 1. 모델 순전파
         logit = self(img)  # [B,2,H,W]
         
-        # 2. 폴리라인 영역만 활성화 (제약조건 적용)
-        masked_logit = logit * polyline_mask.unsqueeze(1)  # [B,1,H,W] -> [B,2,H,W]
-        prob = torch.sigmoid(masked_logit)
+        # 2. 폴리라인 영역만 활성화 (제약조건 적용) - 수정됨
+        mask_expanded = polyline_mask.unsqueeze(1).expand_as(logit)  # [B,1,H,W] -> [B,2,H,W]
+        masked_logit = logit.clone()
+        masked_logit[mask_expanded == 0] = -float('inf')  # 마스크 외부를 -inf로
+        prob = torch.sigmoid(masked_logit)  # sigmoid(-inf) = 0
         
         # 3. 단순한 가우시안 히트맵 생성 (키포인트만)
         target = make_heatmaps_torch(gt, H, W, self.sigma)  # [B,2,H,W]
@@ -208,15 +219,36 @@ class LitKeypoint2(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
+        # 옵티마이저 선택
+        if self.optimizer_type.lower() == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.parameters(), 
+                lr=self.lr, 
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8
+            )
+        elif self.optimizer_type.lower() == "adam":
+            optimizer = torch.optim.Adam(
+                self.parameters(), 
+                lr=self.lr, 
+                weight_decay=self.weight_decay
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {self.optimizer_type}")
+        
+        # OneCycleLR 대신 CosineAnnealingLR 사용 (더 안정적)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.max_epochs,
+            eta_min=self.lr / 100  # 최종 lr = 초기 lr의 1%
         )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_mae_px",
+                "interval": "epoch",  # epoch 단위로 업데이트
                 "frequency": 1,
             },
         }

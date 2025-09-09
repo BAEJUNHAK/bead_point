@@ -9,6 +9,9 @@ from torch.utils.data import Dataset
 from torchvision.transforms.functional import to_tensor
 from torch.nn.utils.rnn import pad_sequence
 
+# 데이터 증강 모듈 import
+from .augmentation import apply_augmentation_pipeline, create_polyline_mask_from_points
+
 
 # ------------------ Blue (bead) ROI detection ------------------
 def detect_blue_roi(img_bgr: np.ndarray,
@@ -215,7 +218,11 @@ class BeadImageKeypointDataset(Dataset):
                  arc_high: float = 0.90,
                  annotation_csv: Optional[str] = None,
                  auto_blue_min: int = 80,
-                 auto_diff_min: int = 40):
+                 auto_diff_min: int = 40,
+                 # 새로운 증강 관련 파라미터
+                 enable_augmentation: bool = True,
+                 augmentation_strength: float = 1.0,
+                 training: bool = True):
         self.size = int(size)
         self.strategy = strategy
         self.arc_low = float(arc_low)
@@ -223,6 +230,11 @@ class BeadImageKeypointDataset(Dataset):
         self.auto_blue_min = int(auto_blue_min)
         self.auto_diff_min = int(auto_diff_min)
         self.ann_map = load_annotation_csv_pointpair(annotation_csv) if annotation_csv else None
+        
+        # 증강 관련 설정 저장
+        self.enable_augmentation = enable_augmentation
+        self.augmentation_strength = augmentation_strength
+        self.training = training
 
         self.imgs: List[str] = sorted(
             glob.glob(os.path.join(img_dir, "*.png")) +
@@ -335,10 +347,31 @@ class BeadImageKeypointDataset(Dataset):
         pts2_r[:,0] *= sx; pts2_r[:,1] *= sy
         # 포인트 순서 일관성을 위해 정렬하지 않음 - 원본 순서 유지
         
-        # 5) 폴리라인 마스크 생성 (제약조건 적용)
         poly_r = poly_px.copy()
         poly_r[:,0] *= sx; poly_r[:,1] *= sy
-        polyline_mask = self._create_polyline_mask(poly_r, self.size, self.size)
+        
+        # 4.5) 데이터 증강 적용 (training 시에만)
+        if self.enable_augmentation and self.training:
+            try:
+                img_r, pts2_r, poly_r = apply_augmentation_pipeline(
+                    img_r, pts2_r, poly_r,
+                    training=True,
+                    strength=self.augmentation_strength
+                )
+            except Exception as e:
+                # 증강 실패 시 원본 데이터 사용 (안전장치)
+                print(f"⚠️ 증강 실패, 원본 사용: {e}")
+                pass
+        else:
+            # 증강 비활성화 시에도 통계 기록
+            apply_augmentation_pipeline(
+                img_r, pts2_r, poly_r,
+                training=False,  # 증강 비활성화
+                strength=0.0
+            )
+        
+        # 5) 폴리라인 마스크 생성 (제약조건 적용) - 증강된 좌표 사용
+        polyline_mask = create_polyline_mask_from_points(poly_r, self.size, self.size)
 
         return {
             "image": to_tensor(img_r),
